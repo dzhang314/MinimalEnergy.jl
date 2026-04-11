@@ -705,7 +705,7 @@ function ThomsonOptimizer(
         allocate(backend, T, 3, n, k), allocate(backend, T, 3, n, k),
         BitVector(undef, k), BitVector(undef, k),
         BitVector(undef, k), BitVector(undef, k), Vector{T}(undef, k),
-        Vector{T}(undef, k),
+        Vector{T}(undef, k), Vector{T}(undef, k),
         Vector{T}(undef, k), Vector{T}(undef, k), Vector{T}(undef, k),
         Vector{T}(undef, k), Vector{T}(undef, k), Vector{T}(undef, k),
         allocate(backend, T, 3, n, k),
