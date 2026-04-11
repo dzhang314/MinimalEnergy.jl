@@ -6,6 +6,7 @@
         "lbfgs",
         "localmem",
         "ndrange",
-        "rsqrt"
+        "rsqrt",
+        "Zhang"
     ]
 }

@@ -1,7 +1,7 @@
 module MinimalEnergy
 
 using KernelAbstractions
-using MultiFloats: rsqrt
+using MultiFloats: div_r, inv_r, rsqrt_r, sqrt_r
 using Random: AbstractRNG, default_rng, rand!, randn
 
 ################################################################################
@@ -160,7 +160,7 @@ export coulomb_energy_force!
                     dx = xi - block_x[1, k]
                     dy = yi - block_x[2, k]
                     dz = zi - block_x[3, k]
-                    inv_r = rsqrt(abs2(dx) + abs2(dy) + abs2(dz))
+                    inv_r = rsqrt_r(abs2(dx) + abs2(dy) + abs2(dz))
                     inv_r2 = inv_r * inv_r
                     inv_r3 = inv_r * inv_r2
                     energy += inv_r
@@ -191,7 +191,7 @@ function coulomb_energy_force!(
     block_size::Int,
     sum_block_size::Int,
 ) where {T}
-    _half = inv(one(T) + one(T))
+    _half = inv_r(one(T) + one(T))
     backend = common_backend(lane_energies, particle_energies, F, x)
     kernel = coulomb_energy_force_kernel!(backend, (block_size, 1))
     num_particles_up = cld(num_particles, block_size) * block_size
@@ -226,7 +226,7 @@ export sphere_step!, sphere_tangent!, sphere_directional_derivative!
         xi = x0[1, i, lane] + step_size * u0[1, i, lane]
         yi = x0[2, i, lane] + step_size * u0[2, i, lane]
         zi = x0[3, i, lane] + step_size * u0[3, i, lane]
-        inv_norm = rsqrt(abs2(xi) + abs2(yi) + abs2(zi))
+        inv_norm = rsqrt_r(abs2(xi) + abs2(yi) + abs2(zi))
         x[1, i, lane] = inv_norm * xi
         x[2, i, lane] = inv_norm * yi
         x[3, i, lane] = inv_norm * zi
@@ -470,8 +470,8 @@ end
     gamma = one(T)
     rho1 = zero(T)
     if isfinite(sy) & isfinite(yy) & (sy < zero(T))
-        gamma = -sy / yy
-        rho1 = inv(sy)
+        gamma = div_r(-sy, yy)
+        rho1 = inv_r(sy)
     end
     if isone(local_index)
         rho[lane, h[1]] = rho1
@@ -584,6 +584,8 @@ struct ThomsonOptimizer{T,
     bracketed_host::BitVector
     modified_host::BitVector
     step_sizes_host::Vector{T}
+    w_host::Vector{T}
+    w0_host::Vector{T}
     a_host::Vector{T}
     Ea_host::Vector{T}
     dEa_host::Vector{T}
@@ -626,6 +628,8 @@ function initialize!(opt::ThomsonOptimizer{T}) where {T}
         opt.E0_host, opt.dE0_host, opt.x0, opt.F0,
         opt.optimization_done_host, opt.line_search_done_host,
         opt.bracketed_host, opt.modified_host, opt.step_sizes_host,
+        opt.w_host,
+        opt.w0_host,
         opt.a_host, opt.Ea_host, opt.dEa_host,
         opt.b_host, opt.Eb_host, opt.dEb_host,
         opt.d, opt.s, opt.y, opt.rho,
@@ -687,7 +691,7 @@ function ThomsonOptimizer(
         x_temp = randn(rng, T)
         y_temp = randn(rng, T)
         z_temp = randn(rng, T)
-        inv_norm = rsqrt(abs2(x_temp) + abs2(y_temp) + abs2(z_temp))
+        inv_norm = rsqrt_r(abs2(x_temp) + abs2(y_temp) + abs2(z_temp))
         x_host[1, i, lane] = inv_norm * x_temp
         x_host[2, i, lane] = inv_norm * y_temp
         x_host[3, i, lane] = inv_norm * z_temp
@@ -701,6 +705,7 @@ function ThomsonOptimizer(
         allocate(backend, T, 3, n, k), allocate(backend, T, 3, n, k),
         BitVector(undef, k), BitVector(undef, k),
         BitVector(undef, k), BitVector(undef, k), Vector{T}(undef, k),
+        Vector{T}(undef, k),
         Vector{T}(undef, k), Vector{T}(undef, k), Vector{T}(undef, k),
         Vector{T}(undef, k), Vector{T}(undef, k), Vector{T}(undef, k),
         allocate(backend, T, 3, n, k),
@@ -782,7 +787,8 @@ struct LineSearchParameters{T}
     c1::T
     c2::T
     contraction_factor::T
-    extrapolation_factor::T
+    extrapolation_lower_bound::T
+    extrapolation_upper_bound::T
 end
 
 
@@ -790,8 +796,9 @@ end
     a::T, ga::T,
     b::T, gb::T,
 ) where {T}
+    delta_x = b - a
     delta_g = gb - ga
-    return a - (ga * (b - a)) / delta_g
+    return a - div_r(ga * delta_x, delta_g)
 end
 
 
@@ -799,10 +806,11 @@ end
     a::T, fa::T, ga::T,
     b::T, fb::T,
 ) where {T}
-    delta_f = (fb - fa) / (b - a)
+    delta_x = b - a
+    delta_f = div_r(fb - fa, delta_x)
     half_delta_g = delta_f - ga
     delta_g = half_delta_g + half_delta_g
-    return a - (ga * (b - a)) / delta_g
+    return a - div_r(ga * delta_x, delta_g)
 end
 
 
@@ -810,18 +818,17 @@ end
     a::T, fa::T, ga::T,
     b::T, fb::T, gb::T,
 ) where {T}
-    delta_f = (fb - fa) / (b - a)
+    delta_x = b - a
+    delta_f = div_r(fb - fa, delta_x)
     two_delta_f = delta_f + delta_f
     three_delta_f = two_delta_f + delta_f
     gc = three_delta_f - (ga + gb)
     s = max(abs(ga), abs(gb), abs(gc))
-    inv_s = inv(s)
-    sqrt_disc = copysign(s, b - a) * sqrt(max(zero(T),
+    inv_s = inv_r(s)
+    sqrt_disc = copysign(s, delta_x) * sqrt_r(max(zero(T),
         abs2(inv_s * gc) - (inv_s * ga) * (inv_s * gb)))
     temp = sqrt_disc - ga
-    p = temp - gc
-    q = (temp + sqrt_disc) + gb
-    return a + (p / q) * (b - a)
+    return a + div_r(temp - gc, (temp + sqrt_disc) + gb) * delta_x
 end
 
 
@@ -829,12 +836,9 @@ end
     a::T, fa::T, ga::T,
     t::T, ft::T, gt::T,
 ) where {T}
-    _half = inv(one(T) + one(T))
+    _half = inv_r(one(T) + one(T))
     tq = quadratic_minimizer(a, fa, ga, t, ft)
     tc = cubic_minimizer(a, fa, ga, t, ft, gt)
-    if !isfinite(tc)
-        return tq
-    end
     return (abs(tc - a) < abs(tq - a)) ? tc : (_half * (tq + tc))
 end
 
@@ -845,36 +849,37 @@ end
 ) where {T}
     ts = secant_minimizer(a, ga, t, gt)
     tc = cubic_minimizer(a, fa, ga, t, ft, gt)
-    if !isfinite(tc)
-        return ts
-    end
     return (abs(tc - t) > abs(ts - t)) ? tc : ts
 end
 
 
 @inline function reduced_slope_step_size(
     a::T, fa::T, ga::T,
+    b::T,
     t::T, ft::T, gt::T,
-    t_min::T, t_max::T, bracketed::Bool,
+    t_min::T, t_max::T, bracketed::Bool, contraction_factor::T,
 ) where {T}
+    delta_x = t - a
+    delta_f = div_r(ft - fa, delta_x)
+    two_delta_f = delta_f + delta_f
+    three_delta_f = two_delta_f + delta_f
+    gc = three_delta_f - (ga + gt)
+    s = max(abs(ga), abs(gt), abs(gc))
+    inv_s = inv_r(s)
+    sqrt_disc = copysign(s, delta_x) * sqrt_r(max(zero(T),
+        abs2(inv_s * gc) - (inv_s * ga) * (inv_s * gt)))
+    r = div_r(sqrt_disc + gt + gc, (ga - gt) - (sqrt_disc + sqrt_disc))
+    tc = ((r > zero(T)) & !iszero(sqrt_disc)) ? (t + r * delta_x) :
+         ((t > a) ? t_max : t_min)
     ts = secant_minimizer(a, ga, t, gt)
-    tc = cubic_minimizer(a, fa, ga, t, ft, gt)
-    if !isfinite(tc)
-        tc = ts
+    t_next = bracketed ? ((abs(tc - t) < abs(ts - t)) ? tc : ts) :
+             ((abs(tc - t) > abs(ts - t)) ? tc : ts)
+    if bracketed
+        mid = t + contraction_factor * (b - t)
+        return (b > t) ? min(mid, t_next) : max(mid, t_next)
+    else
+        return clamp(t_next, t_min, t_max)
     end
-    if t > a
-        if (tc <= t) | !isfinite(tc)
-            tc = t_max
-        end
-    elseif (tc >= t) | !isfinite(tc)
-        tc = t_min
-    end
-    if !isfinite(ts)
-        return tc
-    end
-    dc = abs(t - tc)
-    ds = abs(t - ts)
-    return (bracketed ? (dc < ds) : (dc > ds)) ? tc : ts
 end
 
 
@@ -885,37 +890,22 @@ function next_step_size(
     t_min::T, t_max::T, bracketed::Bool,
     contraction_factor::T,
 ) where {T}
-    _half = inv(one(T) + one(T))
-
-    if !(t_max >= t_min)
-        return (a, fa, ga, b, fb, gb, t, bracketed)
-    end
-    if bracketed & !(min(a, b) < t < max(a, b))
-        return (a, fa, ga, b, fb, gb, t, bracketed)
-    end
-    if !(((t > a) & signbit(ga)) | ((t < a) & !signbit(ga)))
-        return (a, fa, ga, b, fb, gb, t, bracketed)
-    end
-
-    opposite_slope = xor(signbit(ga), signbit(gt))
-    bound = false
+    opposite_slope = (((gt > zero(T)) & (ga < zero(T))) |
+                      ((gt < zero(T)) & (ga > zero(T))))
     t_next = if ft > fa
         bracketed = true
-        bound = true
         higher_value_step_size(a, fa, ga, t, ft, gt)
     elseif opposite_slope
         bracketed = true
         opposite_slope_step_size(a, fa, ga, t, ft, gt)
     elseif abs(gt) < abs(ga)
-        bound = true
-        reduced_slope_step_size(a, fa, ga, t, ft, gt, t_min, t_max, bracketed)
+        reduced_slope_step_size(a, fa, ga, b, t, ft, gt,
+            t_min, t_max, bracketed, contraction_factor)
     elseif bracketed
-        tc = cubic_minimizer(b, fb, gb, t, ft, gt)
-        isfinite(tc) ? tc : (_half * (b + t))
+        cubic_minimizer(b, fb, gb, t, ft, gt)
     else
         (t > a) ? t_max : t_min
     end
-
     if ft > fa
         b, fb, gb = t, ft, gt
     else
@@ -924,27 +914,43 @@ function next_step_size(
         end
         a, fa, ga = t, ft, gt
     end
-
-    t = clamp(t_next, t_min, t_max)
-    if bracketed & bound
-        mid = a + contraction_factor * (b - a)
-        if b > a
-            t = min(mid, t)
-        else
-            t = max(mid, t)
-        end
-    end
-    return (a, fa, ga, b, fb, gb, t, bracketed)
+    return (a, fa, ga, b, fb, gb, t_next, bracketed)
 end
 
 
 @inline function line_search_bounds(
-    a::T, b::T, t::T, bracketed::Bool,
-    extrapolation_factor::T,
+    a::T, b::T, t::T, bracketed::Bool, initial::Bool,
+    extrapolation_lower_bound::T,
+    extrapolation_upper_bound::T,
 ) where {T}
-    t_min = bracketed ? min(a, b) : a
-    t_max = bracketed ? max(a, b) : (t + extrapolation_factor * (t - a))
-    return (t_min, t_max)
+    if initial
+        return (zero(T), t + extrapolation_upper_bound * t)
+    elseif bracketed
+        return minmax(a, b)
+    else
+        return (
+            t + extrapolation_lower_bound * (t - a),
+            t + extrapolation_upper_bound * (t - a))
+    end
+end
+
+
+@inline function line_search_update_bounds!(
+    opt::ThomsonOptimizer{T},
+    lane::Int,
+    lsp::LineSearchParameters{T},
+) where {T}
+    _half = inv_r(one(T) + one(T))
+    if opt.bracketed_host[lane]
+        w = abs(opt.b_host[lane] - opt.a_host[lane])
+        if w >= lsp.contraction_factor * opt.w0_host[lane]
+            opt.step_sizes_host[lane] =
+                _half * (opt.a_host[lane] + opt.b_host[lane])
+        end
+        opt.w0_host[lane] = opt.w_host[lane]
+        opt.w_host[lane] = w
+    end
+    return opt
 end
 
 
@@ -962,6 +968,8 @@ function line_search_initialize!(opt::ThomsonOptimizer{T}) where {T}
     fill!(opt.b_host, zero(T))
     copyto!(opt.Eb_host, opt.E0_host)
     copyto!(opt.dEb_host, opt.dE0_host)
+    fill!(opt.w_host, zero(T))
+    fill!(opt.w0_host, zero(T))
     return opt
 end
 
@@ -1014,12 +1022,17 @@ function line_search!(
     opt::ThomsonOptimizer{T},
     lsp::LineSearchParameters{T},
 ) where {T}
-    _half = inv(one(T) + one(T))
-
     line_search_initialize!(opt)
     for lane = 1:opt.num_lanes
         opt.step_sizes_host[lane] =
             opt.optimization_done_host[lane] ? zero(T) : one(T)
+        t = opt.step_sizes_host[lane]
+        t_min, t_max = line_search_bounds(
+            zero(T), zero(T), t, false, true,
+            lsp.extrapolation_lower_bound,
+            lsp.extrapolation_upper_bound)
+        opt.w_host[lane] = abs(t_max - t_min)
+        opt.w0_host[lane] = opt.w_host[lane] + opt.w_host[lane]
     end
 
     while true
@@ -1043,24 +1056,18 @@ function line_search!(
 
             if (opt.modified_host[lane] &
                 (opt.E_host[lane] <= decrease_target) &
-                (opt.dE_host[lane] >= lsp.c1 * opt.dE0_host[lane]))
+                (opt.dE_host[lane] >= zero(T)))
                 opt.modified_host[lane] = false
             end
 
+            t = opt.step_sizes_host[lane]
+            initial = ((!opt.bracketed_host[lane]) &
+                       iszero(opt.a_host[lane]) & iszero(opt.b_host[lane]))
             t_min, t_max = line_search_bounds(
-                opt.a_host[lane], opt.b_host[lane],
-                opt.step_sizes_host[lane], opt.bracketed_host[lane],
-                lsp.extrapolation_factor)
-            t = clamp(opt.step_sizes_host[lane], t_min, t_max)
-            was_bracketed = opt.bracketed_host[lane]
-            old_width = abs(opt.b_host[lane] - opt.a_host[lane])
-
-            if opt.bracketed_host[lane] & !(t_min < t < t_max)
-                opt.step_sizes_host[lane] = opt.a_host[lane]
-                opt.line_search_done_host[lane] =
-                    (opt.Ea_host[lane] < opt.E0_host[lane])
-                continue
-            end
+                opt.a_host[lane], opt.b_host[lane], t,
+                opt.bracketed_host[lane], initial,
+                lsp.extrapolation_lower_bound,
+                lsp.extrapolation_upper_bound)
 
             if (opt.modified_host[lane] &
                 (decrease_target < opt.E_host[lane] <= opt.Ea_host[lane]))
@@ -1069,18 +1076,20 @@ function line_search!(
                 line_search_update!(opt, lane, lsp, t, t_min, t_max)
             end
 
-            if was_bracketed & opt.bracketed_host[lane]
-                new_width = abs(opt.b_host[lane] - opt.a_host[lane])
-                if new_width >= lsp.contraction_factor * old_width
-                    opt.step_sizes_host[lane] =
-                        _half * (opt.a_host[lane] + opt.b_host[lane])
-                end
+            line_search_update_bounds!(opt, lane, lsp)
+            t_min, t_max = line_search_bounds(
+                opt.a_host[lane], opt.b_host[lane], opt.step_sizes_host[lane],
+                opt.bracketed_host[lane], false,
+                lsp.extrapolation_lower_bound, lsp.extrapolation_upper_bound)
+
+            if (opt.bracketed_host[lane] &
+                !(t_min < opt.step_sizes_host[lane] < t_max))
+                opt.step_sizes_host[lane] = opt.a_host[lane]
+                opt.line_search_done_host[lane] = true
+                continue
             end
 
-            if iszero(opt.step_sizes_host[lane])
-                opt.line_search_done_host[lane] =
-                    (opt.Ea_host[lane] < opt.E0_host[lane])
-            else
+            if !iszero(opt.step_sizes_host[lane])
                 progress = true
             end
 
