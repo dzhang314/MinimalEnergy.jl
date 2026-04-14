@@ -467,11 +467,11 @@ end
     sy = butterfly_sum!(temp2, block_size, local_index)
     yy = butterfly_sum!(temp3, block_size, local_index)
 
-    gamma = one(T)
-    rho1 = zero(T)
-    if isfinite(sy) & isfinite(yy) & (sy < zero(T))
-        gamma = div_r(-sy, yy)
-        rho1 = inv_r(sy)
+    gamma = div_r(-sy, yy)
+    rho1 = inv_r(sy)
+    if !(isfinite(rho1) & isfinite(gamma) & signbit(rho1) & !signbit(gamma))
+        gamma = one(T)
+        rho1 = zero(T)
     end
     if isone(local_index)
         rho[lane, h[1]] = rho1
